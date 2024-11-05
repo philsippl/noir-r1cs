@@ -2,12 +2,17 @@ mod types;
 mod utils;
 
 use acir::{
-    circuit::Opcode,
+    circuit::{opcodes::BlackBoxFuncCall, Opcode},
     native_types::{Expression, Witness, WitnessStack},
     AcirField, FieldElement,
 };
 use clap::{Parser, ValueEnum};
-use std::{collections::HashMap, ops::Neg, vec};
+use ruint::aliases::U256;
+use std::{
+    collections::HashMap,
+    ops::{Neg, Shl, Shr},
+    vec,
+};
 use types::Program;
 use utils::program_at_path;
 
@@ -118,7 +123,7 @@ fn main() {
     println!("Public inputs:  {:?}", circuit.public_parameters.0.len());
     println!("Return values:  {:?}", circuit.return_values.0.len());
 
-    let mut constraints = 0;
+    let mut n_constraints = 0;
     let mut max_witness_index = circuit.current_witness_index;
 
     for opcode in circuit.opcodes.iter() {
@@ -147,14 +152,14 @@ fn main() {
                         r1cs_w.push(w_val);
 
                         // Add constraint on temporary witness
-                        r1cs_a.set(constraints, *remap.get(&a.witness_index()).unwrap(), m);
+                        r1cs_a.set(n_constraints, *remap.get(&a.witness_index()).unwrap(), m);
                         r1cs_b.set(
-                            constraints,
+                            n_constraints,
                             *remap.get(&b.witness_index()).unwrap(),
                             FieldElement::one(),
                         );
                         r1cs_c.set(
-                            constraints,
+                            n_constraints,
                             *remap.get(&max_witness_index).unwrap(),
                             FieldElement::one(),
                         );
@@ -166,35 +171,76 @@ fn main() {
                         current_expr
                             .linear_combinations
                             .push((FieldElement::one(), Witness::from(max_witness_index)));
-                        constraints += 1;
+                        n_constraints += 1;
                     } else {
                         // Either single mul_term left or none
                         if current_expr.mul_terms.len() == 1 {
                             let (m, a, b) = current_expr.mul_terms[0];
-                            r1cs_a.set(constraints, *remap.get(&a.witness_index()).unwrap(), m);
+                            r1cs_a.set(n_constraints, *remap.get(&a.witness_index()).unwrap(), m);
                             r1cs_b.set(
-                                constraints,
+                                n_constraints,
                                 *remap.get(&b.witness_index()).unwrap(),
                                 FieldElement::one(),
                             );
                         }
 
                         // Set all linear combinations and the constant in C
-                        r1cs_c.set(constraints, 0, current_expr.q_c.neg());
+                        r1cs_c.set(n_constraints, 0, current_expr.q_c.neg());
                         for (m, c) in current_expr.linear_combinations {
                             r1cs_c.set(
-                                constraints,
+                                n_constraints,
                                 *remap.get(&c.witness_index()).unwrap(),
                                 m.neg(),
                             );
                         }
 
-                        constraints += 1;
+                        n_constraints += 1;
                         break;
                     }
                 }
             }
-            Opcode::BlackBoxFuncCall(_) => unimplemented!("BlackBoxFuncCall"),
+            Opcode::BlackBoxFuncCall(func) => match *func {
+                BlackBoxFuncCall::<FieldElement>::RANGE { input } => {
+                    let w_idx = *remap.get(&input.to_witness().witness_index()).unwrap();
+                    let w_val: U256 = r1cs_w[w_idx].into_repr().into();
+
+                    // Enforce the binary decomposition of the input in a single constraint
+                    let start_witness_index = max_witness_index + 1;
+                    for i in 0..FieldElement::max_num_bits() {
+                        let bit = w_val.shl(i) & U256::from(1);
+                        let power_two = U256::from(1).shr(i);
+                        max_witness_index += 1;
+                        remap.insert(max_witness_index, r1cs_w.len());
+                        r1cs_w.push(FieldElement::from_repr(bit.try_into().unwrap()));
+                        r1cs_c.set(
+                            n_constraints,
+                            *remap.get(&max_witness_index).unwrap(),
+                            FieldElement::from_repr(power_two.try_into().unwrap()),
+                        );
+                    }
+                    r1cs_c.set(n_constraints, 0, r1cs_w[w_idx].neg());
+
+                    // Add constraint for each bit in the range to be binary
+                    // w_i * (w_i - 1) = 0
+                    for i in 0..input.num_bits() {
+                        let w_idx = *remap.get(&(start_witness_index + i)).unwrap();
+                        r1cs_a.set(n_constraints, w_idx, FieldElement::one());
+                        r1cs_b.set(n_constraints, w_idx, FieldElement::one());
+                        r1cs_b.set(n_constraints, 0, FieldElement::one().neg());
+                        n_constraints += 1;
+                    }
+
+                    // Add constraint for each bit out of range to be zero
+                    // w_i * 1 = 0
+                    for i in input.num_bits()..FieldElement::max_num_bits() {
+                        let w_idx = *remap.get(&(start_witness_index + i)).unwrap();
+                        r1cs_a.set(n_constraints, w_idx, FieldElement::one());
+                        r1cs_b.set(n_constraints, 0, FieldElement::one());
+                        n_constraints += 1;
+                    }
+                }
+                _ => unimplemented!("BlackBoxFuncCall"),
+            },
             Opcode::Directive(_) => unimplemented!("Directive"),
             Opcode::MemoryOp { .. } => unimplemented!("MemoryOp"),
             Opcode::MemoryInit { .. } => unimplemented!("MemoryInit"),
@@ -209,53 +255,53 @@ fn main() {
         Command::Groth16R1CS => {
             for public_input in circuit.public_parameters.0.into_iter() {
                 r1cs_a.set(
-                    constraints,
+                    n_constraints,
                     *remap.get(&public_input.witness_index()).unwrap(),
                     FieldElement::one(),
                 );
-                constraints += 1;
+                n_constraints += 1;
             }
             for public_outputs in circuit.return_values.0.into_iter() {
                 r1cs_a.set(
-                    constraints,
+                    n_constraints,
                     *remap.get(&public_outputs.witness_index()).unwrap(),
                     FieldElement::one(),
                 );
-                constraints += 1;
+                n_constraints += 1;
             }
         }
         _ => {}
     }
 
     // Resize all matrices to same size
-    r1cs_a.resize(constraints, r1cs_w.len());
-    r1cs_b.resize(constraints, r1cs_w.len());
-    r1cs_c.resize(constraints, r1cs_w.len());
+    r1cs_a.resize(n_constraints, r1cs_w.len());
+    r1cs_b.resize(n_constraints, r1cs_w.len());
+    r1cs_c.resize(n_constraints, r1cs_w.len());
 
     println!("Opcodes:        {:?}", circuit.opcodes.len());
     println!("Witnesses:      {:?}", r1cs_w.len());
-    println!("Constraints:    {:?}", constraints);
+    println!("Constraints:    {:?}", n_constraints);
 
     let a = r1cs_a.get_matrix();
     let b = r1cs_b.get_matrix();
     let c = r1cs_c.get_matrix();
 
     // Verify r1cs contraints: Ax * Bx = Cx
-    for i in 0..constraints {
+    for i in 0..n_constraints {
         let ax = dot(&a[i * r1cs_w.len()..(i + 1) * r1cs_w.len()], &r1cs_w);
         let bx = dot(&b[i * r1cs_w.len()..(i + 1) * r1cs_w.len()], &r1cs_w);
         let cx = dot(&c[i * r1cs_w.len()..(i + 1) * r1cs_w.len()], &r1cs_w);
         assert!(ax * bx == cx, "Constraint {} is invalid.", i);
 
-        println!(
-            "({:?} x {:?}ᵀ) * ({:?} x {:?}ᵀ) = ({:?} x {:?}ᵀ)",
-            &a[i * r1cs_w.len()..(i + 1) * r1cs_w.len()],
-            &r1cs_w,
-            &b[i * r1cs_w.len()..(i + 1) * r1cs_w.len()],
-            &r1cs_w,
-            &c[i * r1cs_w.len()..(i + 1) * r1cs_w.len()],
-            &r1cs_w,
-        );
+        // println!(
+        //     "({:?} x {:?}ᵀ) * ({:?} x {:?}ᵀ) = ({:?} x {:?}ᵀ)",
+        //     &a[i * r1cs_w.len()..(i + 1) * r1cs_w.len()],
+        //     &r1cs_w,
+        //     &b[i * r1cs_w.len()..(i + 1) * r1cs_w.len()],
+        //     &r1cs_w,
+        //     &c[i * r1cs_w.len()..(i + 1) * r1cs_w.len()],
+        //     &r1cs_w,
+        // );
     }
 
     println!("✅ All constraints are valid.")

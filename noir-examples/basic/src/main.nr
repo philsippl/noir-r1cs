@@ -1,10 +1,10 @@
-fn main(a: Field, b: pub Field, c: pub Field, d: pub Field) {
-    assert(a * b + c == d);
+fn main(a: pub u8, b: pub u8) {
+    assert(a == b);
 }
 
 #[test]
 fn test_main() {
-    main(1, 2, 3, 5);
+    main(1, 1);
 }
 
 // use dep::poseidon2;
