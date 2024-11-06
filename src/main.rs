@@ -219,6 +219,7 @@ fn main() {
                         );
                     }
                     r1cs_c.set(n_constraints, 0, r1cs_w[w_idx].neg());
+                    n_constraints += 1;
 
                     // Add constraint for each bit in the range to be binary
                     // w_i * (w_i - 1) = 0
